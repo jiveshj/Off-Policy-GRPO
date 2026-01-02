@@ -23,7 +23,6 @@ from tina.post_train_hf.grpo_trainer import GRPOTrainer
 from tina.post_train_hf.grpo_config import GRPOConfig
 from trl import ModelConfig
 from torch.utils.data import DataLoader
-
 logger = logging.getLogger(__name__)
 
 
@@ -122,16 +121,45 @@ class WorkerNode:
             num_epochs: Number of epochs to train on local dataset
         """
         logger.info(f"\n{'='*60}")
-        logger.info(f"[Worker {self.worker_id}] Starting Pre-training")
+        logger.info(f"[Worker {self.worker_id}] Starting Fine-tuning")
         logger.info(f"Local dataset size: {len(self.local_dataset)}")
         logger.info(f"Epochs: {num_epochs}")
         logger.info(f"{'='*60}")
         
-        # Create a temporary config for pre-training
+        # ============================================================
+        # SPEED TEST CONFIGURATION
+        # ============================================================
+        TEST_MODE = False  # Set to False for full training
+        
+        if TEST_MODE:
+            # Limit to small subset for speed testing
+            test_dataset = self.local_dataset.select(range(min(100, len(self.local_dataset))))
+            logger.info(f"⚠️  SPEED TEST MODE: Using only {len(test_dataset)} samples")
+            dataset_to_use = test_dataset
+        else:
+            dataset_to_use = self.local_dataset
+
+
+        # CRITICAL FIX: Enable gradients for embeddings when using gradient checkpointing
+        if hasattr(self.model, 'get_input_embeddings'):
+            for param in self.model.get_input_embeddings().parameters():
+                param.requires_grad = True
+        
+        # If using PEFT, also ensure base model embeddings have gradients
+        if hasattr(self.model, 'base_model'):
+            if hasattr(self.model.base_model, 'get_input_embeddings'):
+                for param in self.model.base_model.get_input_embeddings().parameters():
+                    param.requires_grad = True
+
+        # Create a temporary config for Fine-tuning
         finetune_config = copy.deepcopy(self.worker_training_config)
         finetune_config.num_train_epochs = num_epochs
-        
-        # Initialize GRPOTrainer for pre-training (did not add callbacks as was done in the Tina Repo)
+        # OPTIMIZATION 1: Enable vLLM (10-20x faster generation)
+        finetune_config.vllm_device = "auto"
+        finetune_config.deepspeed = "ds_config.json"
+
+        self.model.train()
+        # Initialize GRPOTrainer for fine_tuning (did not add callbacks as was done in the Tina Repo)
         self.trainer = GRPOTrainer(
             model=self.model,
             processing_class=self.tokenizer,
@@ -140,6 +168,29 @@ class WorkerNode:
             train_dataset=self.local_dataset
         )
         
+
+        print(f"\n{'='*60}")
+        print(f"[Worker {self.worker_id}] Starting Pre-training")
+        print(f"{'='*60}")
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in self.model.parameters())
+        
+        print(f"\n{'='*60}")
+        print(f"TRAINABLE PARAMETERS CHECK")
+        print(f"{'='*60}")
+        print(f"Trainable: {trainable_params:,}")
+        print(f"Total: {all_params:,}")
+        print(f"Percentage: {100 * trainable_params / all_params:.2f}%")
+        print(f"{'='*60}\n")
+        
+        if trainable_params == 0:
+            print("ERROR: NO TRAINABLE PARAMETERS!")
+            print("\nParameter status:")
+            for name, param in list(self.model.named_parameters())[:20]:  # First 20 params
+                print(f"  {name}: requires_grad={param.requires_grad}, shape={param.shape}")
+            raise ValueError("No trainable parameters! Check PEFT/LoRA configuration.")
+
+
         # Train on local dataset
         logger.info(f"[Worker {self.worker_id}] Training...")
         train_result = self.trainer.train()
@@ -147,7 +198,7 @@ class WorkerNode:
         logger.info(f"[Worker {self.worker_id}] Fine-tuning completed!")
         logger.info(f"Final loss: {train_result.metrics.get('train_loss', 'N/A')}")
         
-        # Mark as pre-trained
+        # Mark as fine-tuned
         self.is_finetuned = True
         
         #Clean up trainer
@@ -189,6 +240,8 @@ class WorkerNode:
                     max_length=self.training_config.max_prompt_length
                 ).to(self.device)
                 
+                prev_cache = getattr(self.model.config, 'use_cache', True)
+                self.model.config.use_cache = True
                 # Generate completion
                 outputs = self.model.generate(
                     **inputs,
@@ -198,6 +251,7 @@ class WorkerNode:
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
+                self.model.config.use_cache = prev_cache
                 
                 # Extract completion (I should not make a completion mask here because prompt is a single prompt)
                 prompt_len = inputs.input_ids.shape[1]
@@ -889,8 +943,10 @@ class DistributedOffPolicyGRPO:
             model_name_or_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=model_config.attn_implementation,
-            use_cache=False if training_config.gradient_checkpointing else True
+            low_cpu_mem_usage=True,
+            # use_cache=False if training_config.gradient_checkpointing else True
         )
+        self.base_model.config.use_cache = True
         
         logger.info(f"Base model loaded: {sum(p.numel() for p in self.base_model.parameters()):,} parameters")
         
