@@ -157,6 +157,12 @@ class WorkerNode:
         # OPTIMIZATION 1: Enable vLLM (10-20x faster generation)
         finetune_config.vllm_device = "auto"
         finetune_config.deepspeed = "ds_config.json"
+        # OPTIMIZATION 2: Enable gradient checkpointing to save memory
+        finetune_config.gradient_checkpointing = True
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            logger.info(f"[Worker {self.worker_id}] Enabling gradient checkpointing")
+            self.model.gradient_checkpointing_enable()
+
 
         self.model.train()
         # Initialize GRPOTrainer for fine_tuning (did not add callbacks as was done in the Tina Repo)
@@ -201,8 +207,8 @@ class WorkerNode:
         # Mark as fine-tuned
         self.is_finetuned = True
         
-        #Clean up trainer
-        del trainer
+        # Clean up trainer
+        del self.trainer
         torch.cuda.empty_cache()
         
         logger.info(f"[Worker {self.worker_id}] Pre-training finished\n")
@@ -230,39 +236,41 @@ class WorkerNode:
         responses = []
         
         with torch.no_grad():
-            for prompt in prompts:
-                # Tokenize prompt
-                inputs = self.tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.training_config.max_prompt_length
-                ).to(self.device)
-                
-                prev_cache = getattr(self.model.config, 'use_cache', True)
-                self.model.config.use_cache = True
-                # Generate completion
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.training_config.max_completion_length,
-                    temperature=self.training_config.temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
-                self.model.config.use_cache = prev_cache
-                
-                # Extract completion (I should not make a completion mask here because prompt is a single prompt)
-                prompt_len = inputs.input_ids.shape[1]
-                completion_ids = outputs[0][prompt_len:]
+            # OPTIMIZATION: Batch all prompts together instead of one-by-one
+            # Tokenize all prompts at once
+            inputs = self.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.training_config.max_prompt_length
+            ).to(self.device)
+            
+            prev_cache = getattr(self.model.config, 'use_cache', True)
+            self.model.config.use_cache = True
+            
+            # Generate completions for all prompts in one batch
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.training_config.max_completion_length,
+                temperature=self.training_config.temperature,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            self.model.config.use_cache = prev_cache
+            
+            # Process each output
+            for idx, (prompt, output) in enumerate(zip(prompts, outputs)):
+                # Extract completion (from end of prompt to end of output)
+                prompt_len = inputs.input_ids[idx].shape[0] if inputs.input_ids.shape[0] > 0 else len(self.tokenizer(prompt)["input_ids"])
+                completion_ids = output[prompt_len:]
                 completion = self.tokenizer.decode(
                     completion_ids,
                     skip_special_tokens=True
                 )
                 
                 # Compute reward locally using reward functions
-                # Need to create a sample dict for reward functions
                 sample = {
                     "prompt": prompt,
                     "completion": completion
@@ -282,7 +290,7 @@ class WorkerNode:
                     prompt=prompt,
                     completion=completion,
                     reward=avg_reward,
-                    prompt_input_ids=inputs.input_ids[0],
+                    prompt_input_ids=inputs.input_ids[idx],
                     completion_input_ids=completion_ids
                 ))
         
@@ -336,7 +344,7 @@ class ParameterServer:
         # π_base: Frozen base model (π_old) - never changes!
         logger.info("Creating π_base (frozen reference model)...")
         self.pi_ref = copy.deepcopy(base_model)
-        self.pi_ref.to(device)
+        self.pi_ref.to("cpu")
         self.pi_ref.eval()
         
         # Freeze π_base completely
@@ -347,7 +355,7 @@ class ParameterServer:
         
         # π_server: Parameter server model being optimized
         logger.info("Creating π_server (optimizable model)...")
-        self.pi_server = copy.deepcopy(base_model)
+        self.pi_server = base_model
         
         # Apply LoRA to π_server
         if model_config.use_peft:
@@ -589,7 +597,8 @@ class ParameterServer:
             max_length=self.training_config.max_prompt_length + self.training_config.max_completion_length
         ).to(self.device)
         
-        # Tokenize prompts only to get prompt lengths  (can't we simply find the prompt lengths from the input arguments above?)
+        # OPTIMIZATION: Get prompt lengths WITHOUT redundant tokenization
+        # Tokenize prompts only (separate from completions) to get their token lengths
         prompt_inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
@@ -598,35 +607,40 @@ class ParameterServer:
             max_length=self.training_config.max_prompt_length
         ).to(self.device)
 
-        prompt_lengths = prompt_inputs.input_ids.shape[1] #should this be prompt_inputs.attention_mask.sum(dim = 1)  ?
+        # Get actual prompt lengths (accounting for padding)
+        prompt_lengths = prompt_inputs.attention_mask.sum(dim=1).long()
 
         with torch.no_grad():
             # Forward pass
             outputs = model(**inputs)
             logits = outputs.logits
             
-            # Get completion tokens (everything after prompt)
-            # Shape: [batch_size, seq_len - prompt_len]
-            completion_ids = inputs.input_ids[:, prompt_lengths:]
+            # Process each sample individually to handle variable prompt lengths
+            sequence_log_probs = []
             
-            # Compute log probabilities
-            # logits[:, prompt_lengths-1:-1] aligns with completion_ids
-            #log_probs shape: [batch_size, completion_len, vocab_size] - This means that there are log probabilities for each token in the vocabulary at each position in the completion. 
-            log_probs = torch.nn.functional.log_softmax(
-                logits[:, prompt_lengths-1:-1, :], dim=-1
-            )
+            for i in range(len(prompts)):
+                prompt_len = prompt_lengths[i]
+                # Get completion tokens (everything after prompt)
+                completion_ids = inputs.input_ids[i, prompt_len:]
+                
+                # Get logits for completion (shift by 1 for next token prediction)
+                # logits[:, prompt_len-1:-1, :] gets logits up to last completion token
+                log_probs = torch.nn.functional.log_softmax(
+                    logits[i, prompt_len-1:-1, :], dim=-1
+                )
+                
+                # Gather log probs for actual completion tokens
+                token_log_probs = log_probs.gather(
+                    1, completion_ids.unsqueeze(-1)
+                ).squeeze(-1)
+                
+                # Sum over completion sequence
+                sequence_log_probs.append(token_log_probs.sum())
             
-            # Gather log probs for actual completion tokens
-            # Shape: [batch_size, completion_len]
-            token_log_probs = log_probs.gather(
-                2, completion_ids.unsqueeze(-1) # unsqueeze to match dimensions with log_probs so completion_ids shape becomes [batch_size, completion_len, 1]
-            ).squeeze(-1)
-            
-            # Sum over sequence length to get log P(completion | prompt)
-            # Shape: [batch_size]   (summing log probabilities is multiplying probabilities)
-            sequence_log_probs = token_log_probs.sum(dim=1)
+            # Stack results
+            sequence_log_probs = torch.stack(sequence_log_probs)
         
-        return sequence_log_probs   #in the training step, I will need to find the log probs ratio iteratively for each new word added
+        return sequence_log_probs
     
     # the prompts are the same for all the workers and the parameter server so do we need batch["prompts"]. Also, the batch size is 1 so do we need completion_mask (or is it to make it more gneral) It shoud be off policy data so the responses will not be generated by pi_old.
     def train_step(self, num_steps: int = 1, batch_size: int = 1) -> Dict:
@@ -719,8 +733,18 @@ class ParameterServer:
             
             # Forward pass through π_base (reference policy)
             with torch.no_grad():
+                # Temporarily move pi_ref to GPU if needed
+                pi_ref_device = next(self.pi_ref.parameters()).device
+                if pi_ref_device.type == 'cpu':
+                    self.pi_ref.to(self.device)
+                
                 ref_outputs = self.pi_ref(**inputs)
-                ref_logits = ref_outputs.logits
+                ref_logits = ref_outputs.logits.clone()
+                
+                # Move back to CPU
+                if pi_ref_device.type == 'cpu':
+                    self.pi_ref.to("cpu")
+
             
         
             input_ids = inputs.input_ids
