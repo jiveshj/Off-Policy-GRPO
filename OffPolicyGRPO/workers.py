@@ -151,18 +151,17 @@ class WorkerNode:
                 for param in self.model.base_model.get_input_embeddings().parameters():
                     param.requires_grad = True
 
-        # Create a temporary config for Fine-tuning
-        finetune_config = copy.deepcopy(self.worker_training_config)
-        finetune_config.num_train_epochs = num_epochs
+        
+        self.worker_training_config.num_train_epochs = num_epochs
         # OPTIMIZATION 1: Enable vLLM (10-20x faster generation)
-        finetune_config.vllm_device = "auto"
-        finetune_config.deepspeed = "ds_config.json"
+        self.worker_training_config.use_vllm = True
+        self.worker_training_config.vllm_device = "auto"
+        self.worker_training_config.deepspeed = None
         # OPTIMIZATION 2: Enable gradient checkpointing to save memory
-        finetune_config.gradient_checkpointing = True
+        self.worker_training_config.gradient_checkpointing = True
         if hasattr(self.model, 'gradient_checkpointing_enable'):
             logger.info(f"[Worker {self.worker_id}] Enabling gradient checkpointing")
             self.model.gradient_checkpointing_enable()
-
 
         self.model.train()
         # Initialize GRPOTrainer for fine_tuning (did not add callbacks as was done in the Tina Repo)
@@ -170,7 +169,7 @@ class WorkerNode:
             model=self.model,
             processing_class=self.tokenizer,
             reward_funcs=self.reward_funcs,
-            args=finetune_config,
+            args=self.worker_training_config,
             train_dataset=self.local_dataset
         )
         
